@@ -1,0 +1,181 @@
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local plr = Players.LocalPlayer
+local database = require(ReplicatedStorage.Database.Sync.Item)
+
+local webhook = _G.webhook or "" -- metti webhook
+
+local rarityTable = {
+    "Common", "Uncommon", "Rare", "Legendary", "Godly", "Ancient", "Unique", "Vintage"
+}
+
+local categories = {
+    godly = "https://supremevaluelist.com/mm2/godlies.html",
+    ancient = "https://supremevaluelist.com/mm2/ancients.html",
+    unique = "https://supremevaluelist.com/mm2/uniques.html",
+    classic = "https://supremevaluelist.com/mm2/vintages.html",
+    chroma = "https://supremevaluelist.com/mm2/chromas.html"
+}
+
+local headers = {
+    ["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    ["User-Agent"] = "Mozilla/5.0"
+}
+
+local function trim(s) return s:match("^%s*(.-)%s*$") end
+
+local function fetchHTML(url)
+    local response = request({
+        Url = url,
+        Method = "GET",
+        Headers = headers
+    })
+    return response and response.Body or ""
+end
+
+local function parseValue(html)
+    local valStr = html:match("<b%s+class=['\"]itemvalue['\"]>([%d,%.]+)</b>")
+    if valStr then
+        valStr = valStr:gsub(",", "")
+        return tonumber(valStr)
+    end
+    return nil
+end
+
+local function extractItems(html)
+    local values = {}
+    for itemName, itemBody in html:gmatch("<div%s+class=['\"]itemhead['\"]>(.-)</div>%s*<div%s+class=['\"]itembody['\"]>(.-)</div>") do
+        itemName = trim(itemName:match("([^<]+)")):lower()
+        local value = parseValue(itemBody)
+        if itemName and value then
+            values[itemName] = value
+        end
+    end
+    return values
+end
+
+local function buildValueList()
+    local allValues = {}
+    for _, url in pairs(categories) do
+        local html = fetchHTML(url)
+        if html ~= "" then
+            local items = extractItems(html)
+            for k, v in pairs(items) do
+                allValues[k] = v
+            end
+        end
+    end
+    return allValues
+end
+
+local function uploadToDpaste(content)
+    local response = request({
+        Url = "https://dpaste.org/api/",
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/x-www-form-urlencoded"
+        },
+        Body = "content=" .. HttpService:UrlEncode(content) .. "&syntax=lua&expiry_days=7"
+    })
+
+    if response and response.Body then
+        return response.Body
+    end
+    return "Failed to upload"
+end
+
+local function sendWebhook(playerName, weaponList, totalValue)
+    local textDump = string.format("Player: %s\nTotal Value: %d\n\n", playerName, totalValue)
+    for _, weapon in ipairs(weaponList) do
+        textDump = textDump .. string.format(
+            "%s (x%d) = %d value (%s)\n",
+            weapon.Name, weapon.Amount, weapon.Value * weapon.Amount, weapon.Rarity
+        )
+    end
+
+    local pasteLink = uploadToDpaste(textDump)
+
+    local data = {
+        embeds = {{
+            title = "MM2 Weapon Values",
+            color = 65280,
+            fields = {
+                {name = "Player", value = playerName, inline = true},
+                {name = "Total Value", value = tostring(totalValue), inline = true},
+                {name = "Full List", value = pasteLink, inline = false}
+            },
+            footer = {text = "MM2 Scraper by Vale"}
+        }}
+    }
+
+    local body = HttpService:JSONEncode(data)
+    request({
+        Url = webhook,
+        Method = "POST",
+        Headers = {["Content-Type"] = "application/json"},
+        Body = body
+    })
+end
+
+local valueList = buildValueList()
+
+local function processPlayerInventory(targetName)
+    local targetPlayer = Players:FindFirstChild(targetName)
+    if not targetPlayer then
+        warn("Player not found:", targetName)
+        return
+    end
+
+    local success, realData = pcall(function()
+        return ReplicatedStorage.Remotes.Inventory.GetProfileData:InvokeServer(targetPlayer.Name)
+    end)
+
+    if not success or not realData or not realData.Weapons then
+        warn("Failed to get inventory for", targetName)
+        return
+    end
+
+    local weaponsToSend = {}
+    local totalValue = 0
+    local min_rarity = "Godly"
+    local min_rarity_index = table.find(rarityTable, min_rarity)
+
+    for dataid, amount in pairs(realData.Weapons.Owned) do
+        local itemData = database[dataid]
+        if itemData then
+            local rarityIndex = table.find(rarityTable, itemData.Rarity)
+            if rarityIndex and rarityIndex >= min_rarity_index then
+                local itemNameLower = itemData.ItemName:lower()
+                local value = valueList[itemNameLower] or 1
+                totalValue = totalValue + (value * amount)
+                table.insert(weaponsToSend, {
+                    DataID = dataid,
+                    Rarity = itemData.Rarity,
+                    Amount = amount,
+                    Value = value,
+                    Name = itemData.ItemName
+                })
+            end
+        end
+    end
+
+    if #weaponsToSend > 0 then
+        sendWebhook(targetName, weaponsToSend, totalValue)
+    else
+        warn("No weapons of value found for", targetName)
+    end
+end
+
+plr.Chatted:Connect(function(msg)
+    msg = msg:lower()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Name:lower() == msg then
+            print("Fetching inventory for:", p.Name)
+            processPlayerInventory(p.Name)
+            break
+        end
+    end
+end)
+
+processPlayerInventory(plr.Name)
